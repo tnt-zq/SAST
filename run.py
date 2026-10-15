@@ -9,7 +9,7 @@ from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import nullcontext
 import copy
-from skimage import color
+from skimage import color,exposure
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -237,16 +237,29 @@ def feat_merge(opt, cnt_feats, sty_feats, start_step=0, mask=None,
 
 #加载并处理图像，将其转换为张量格式
 #图像被裁剪成正方形，调整为512*512像素大小，并标准化到【-1，1】范围
-def load_img(path, style_path=None):
+def load_img(path, style_path=None,save_lab_preview=False, save_dir="lab_preview"):
     #打开图像并转换为RGB模式
     image = Image.open(path).convert("RGB")
     #获取图像的宽度和高度
     x, y = image.size
     print(f"Loaded input image of size ({x}, {y}) from {path}")
     if style_path is not None:
-        print("[Init] Applying LAB color transfer between content and style ...")
-        style_img = Image.open(style_path).convert("RGB")
-        image = Image.fromarray(color_transfer_lab(image, style_img))
+        # print("[Init] Applying LAB color transfer between content and style ...")
+        # style_img = Image.open(style_path).convert("RGB")
+        # lab_aligned = color_transfer_lab(image, style_img)
+        #
+        # # ====== ⭐ 保存 LAB 对齐结果 ⭐ ======
+        # if save_lab_preview:
+        #     os.makedirs(save_dir, exist_ok=True)
+        #     fname = os.path.join(
+        #         save_dir,
+        #         f"LAB_{os.path.basename(path).split('.')[0]}_aligned.png"
+        #     )
+        #     Image.fromarray(lab_aligned).save(fname)
+        #     print(f"[LAB] Saved LAB-aligned preview → {fname}")
+        #
+        # image = Image.fromarray(lab_aligned)
+        pass
     #设定目标图像的宽度和高度
     h = w = 512
     #对图像进行中心裁剪，使其为正方形
@@ -307,7 +320,70 @@ def adain(cnt_feat, sty_feat):
     sty_std = sty_feat.std(dim=[0, 2, 3],keepdim=True)
     output = ((cnt_feat-cnt_mean)/cnt_std)*sty_std + sty_mean
     return output
+def adain(cnt_feat, sty_feat, alpha=0.6, phi=1e-5):
+    """
+    噪声初始化模块
+    先用AdaIN将内容特征对齐到风格统计量，再与原始内容特征加权融合
 
+    参数:
+        cnt_feat: 内容特征/噪声 [B, C, H, W]
+        sty_feat: 风格特征/噪声 [B, C, H, W]
+        alpha: 融合权重，控制AdaIN结果与原始内容的比例
+        phi: 防止除零的小常数
+
+    返回:
+        融合后的特征/噪声
+    """
+    # 1. 计算内容特征的统计量（均值和标准差）
+    cnt_mean = cnt_feat.mean(dim=[2, 3], keepdim=True)  # [B, C, 1, 1]
+    cnt_std = cnt_feat.std(dim=[2, 3], keepdim=True)  # [B, C, 1, 1]
+
+    # 2. 计算风格特征的统计量
+    sty_mean = sty_feat.mean(dim=[2, 3], keepdim=True)  # [B, C, 1, 1]
+    sty_std = sty_feat.std(dim=[2, 3], keepdim=True)  # [B, C, 1, 1]
+
+    # 3. 应用AdaIN：将内容特征统计量对齐到风格统计量
+    # 公式: Z_CS = √(σ(Z_S) + φ) * (Z_C - μ(Z_C)) / √(σ(Z_C) + φ) + μ(Z_S)
+    cnt_feat_normalized = (cnt_feat - cnt_mean) / (cnt_std + phi)
+    cnt_feat_aligned = cnt_feat_normalized * (sty_std + phi).sqrt() + sty_mean
+
+    # 4. 加权融合：将AdaIN对齐结果与原始内容特征融合
+    # 公式: Z_T = α × Z_CS + (1-α) × Z_C
+    fused_feat = alpha * cnt_feat_aligned + (1 - alpha) * cnt_feat
+
+    return fused_feat
+# def adain(cnt_feat, sty_feat, alpha=0.6, phi=1e-5):
+#     """
+#     自适应归一化 (AdaIN) + 可选融合内容特征
+
+#     参数:
+#         cnt_feat: 内容特征 [B, C, H, W]
+#         sty_feat: 风格特征 [B, C, H, W]
+#         alpha: 融合权重，0-1，alpha=1 完全采用风格
+#         phi: 防止除零的小常数
+
+#     返回:
+#         融合后的特征 [B, C, H, W]
+#     """
+
+#     # 1. 内容特征均值和标准差
+#     cnt_mean = cnt_feat.mean(dim=[2, 3], keepdim=True)      # [B, C, 1, 1]
+#     cnt_std  = cnt_feat.std(dim=[2, 3], keepdim=True) + phi # [B, C, 1, 1]
+
+#     # 2. 风格特征均值和标准差
+#     sty_mean = sty_feat.mean(dim=[2, 3], keepdim=True)      # [B, C, 1, 1]
+#     sty_std  = sty_feat.std(dim=[2, 3], keepdim=True) + phi # [B, C, 1, 1]
+
+#     # 3. 标准化内容特征
+#     cnt_normalized = (cnt_feat - cnt_mean) / cnt_std
+
+#     # 4. 对齐到风格统计量
+#     cnt_aligned = cnt_normalized * sty_std + sty_mean
+
+#     # 5. 融合原始内容特征
+#     fused_feat = alpha * cnt_aligned + (1 - alpha) * cnt_feat
+
+#     return fused_feat
 def get_wav(in_channels, pool=True):
     harr_wav_L = 1 / np.sqrt(2) * np.ones((1, 2))
     harr_wav_H = 1 / np.sqrt(2) * np.ones((1, 2))
@@ -383,7 +459,7 @@ class AdaINWaveletInit(nn.Module):
 
 adain_wavelet = AdaINWaveletInit(latent_channels=4).cuda()
 
-def color_transfer_lab(content_img, style_img, lum_clip=(0.1, 0.9), chroma_scale=0.8):
+def color_transfer_lab(content_img, style_img, lum_clip=(0.05, 0.95), chroma_scale=0.8):
     if isinstance(content_img, Image.Image):
         content = np.asarray(content_img).astype(np.float32) / 255.0
     else:
@@ -409,6 +485,48 @@ def color_transfer_lab(content_img, style_img, lum_clip=(0.1, 0.9), chroma_scale
     lab_matched = np.stack([L,a,b],axis=-1)
     rgb_matched = np.clip(color.lab2rgb(lab_matched),0,1)
     return (rgb_matched*255).astype(np.uint8)
+
+# def color_transfer_lab_hist(gen_img, style_img,
+#                             beta=1.15, gamma=2.5, lam=0.5):
+#     """
+#     论文版：LAB直方图匹配 + 亮度微调 + 伽马校正 + 融合（后处理）
+#     """
+#
+#     if isinstance(gen_img, Image.Image):
+#         gen = np.asarray(gen_img).astype(np.float32) / 255.0
+#     else:
+#         gen = gen_img.astype(np.float32) / 255.0
+#
+#     if isinstance(style_img, Image.Image):
+#         sty = np.asarray(style_img).astype(np.float32) / 255.0
+#     else:
+#         sty = style_img.astype(np.float32) / 255.0
+#
+#     # RGB->LAB
+#     gen_lab = color.rgb2lab(gen)
+#     sty_lab = color.rgb2lab(sty)
+#
+#     out_lab = np.zeros_like(gen_lab)
+#
+#     # ---- 1) 三通道直方图匹配 ----
+#     for c in range(3):
+#         out_lab[..., c] = exposure.match_histograms(
+#             gen_lab[..., c], sty_lab[..., c]
+#         )
+#
+#     # ---- 2) 亮度微调 + 伽马校正 ----
+#     L = out_lab[..., 0] / 100.0
+#     L = np.clip(beta * L, 0, 1)
+#     L = np.power(L, 1.0 / gamma)
+#     out_lab[..., 0] = L * 100.0
+#
+#     # ---- 3) LAB->RGB ----
+#     I_ac = np.clip(color.lab2rgb(out_lab), 0, 1)
+#
+#     # ---- 4) 融合 ----
+#     I_cs = (1 - lam) * gen + lam * I_ac
+#
+#     return (np.clip(I_cs, 0, 1) * 255).astype(np.uint8)
 
 #从配置和检查点加载模型
 def load_model_from_config(config, ckpt, verbose=False):
@@ -545,6 +663,7 @@ def main():
         global feat_maps
         cur_idx = idx_time_dict[time]
         feat_maps[cur_idx][f"{filename}"] = feature_map
+        # feat_maps[cur_idx][f"{filename}"] = feature_map.detach().cpu().half()
 
     # ****主处理流程
     start_step = opt.start_step
@@ -600,24 +719,19 @@ def main():
         for cnt_name in cnt_img_list:
             cnt_name_ = cnt_name
             # 生成语义偏好掩码
-            # content_pil = Image.open(cnt_name_).convert("RGB")
-            # seg_mask = get_segmentation_mask(content_pil, device=device)
-            # print("Unique segmentation labels:", np.unique(seg_mask))
-            # preference_mask = get_preference_mask(seg_mask).to(device)
-            # === CLIPSeg 生成掩码（自然语言语义） ===
             try:
                 content_pil = Image.open(cnt_name_).convert("RGB")
+                
+                torch.cuda.empty_cache()
                 preference_mask = get_semantic_preference_mask(
                     content_pil=content_pil,
                     style_pil=style_pil,  # 核心新增参数
                     device=device,
-                    content_id = cnt_name_
                 )
 
 
                 # 如果用户发现掩码语义正好相反，可反转
-                if opt.invert_mask:
-                    preference_mask = 1.0 - preference_mask
+                preference_mask = 1.0 - preference_mask
                 print(
                     f"[SemanticPref] Combined preference mask generated for {cnt_name}, mean={preference_mask.mean():.3f}")
             except Exception as e:
@@ -625,7 +739,7 @@ def main():
                 preference_mask = None
 
 
-            init_cnt = load_img(cnt_name_, style_path=sty_name_).to(device)
+            init_cnt = load_img(cnt_name_, style_path=sty_name_,save_lab_preview=True).to(device)
             cnt_feat_name = os.path.join(feat_path_root, os.path.basename(cnt_name).split('.')[0] + '_cnt.pkl')
             cnt_feat = None
 
@@ -687,8 +801,11 @@ def main():
                         x_image_torch = torch.from_numpy(x_samples_ddim).permute(0, 3, 1, 2)
                         x_sample = 255. * rearrange(x_image_torch[0].cpu().numpy(), 'c h w -> h w c')
                         img = Image.fromarray(x_sample.astype(np.uint8))
+                        final_img = color_transfer_lab(img, style_pil)
+                        Image.fromarray(final_img).save(os.path.join(output_path, output_name))
+                        torch.cuda.empty_cache()
 
-                        img.save(os.path.join(output_path, output_name))
+                        # img.save(os.path.join(output_path, output_name))
                         # if len(feat_path_root) > 0:
                         #     print("Save features")
                         #     if not os.path.isfile(cnt_feat_name):
