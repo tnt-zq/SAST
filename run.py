@@ -31,26 +31,11 @@ from semantic_mask_clipseg import get_preference_mask as get_clipseg_mask
 
 # === 新的人类偏好驱动语义掩码 ===
 from semantic_preference_mask_sam import get_semantic_preference_mask_sam as get_semantic_preference_mask
-# from semantic_preference_mask import get_semantic_preference_mask
-# from semantic_preference_mask_segformer import get_semantic_preference_mask
 from text_protect_mask import get_text_protect_mask
 
 
 #全局变量，用于存储特征图
 feat_maps = []
-user_preference = {
-    # 人物与动物
-    "person": 0.5, "face": 0.5,"text": 0.1, "dog": 0.6, "cat": 0.6, "horse": 0.6, "bird": 0.6, "sheep": 0.6, "cow": 0.6,
-    # 建筑与人工设施
-    "building": 0.8, "bridge": 0.5, "tower": 0.8, "house": 0.8, "road": 0.8, "sidewalk": 0.7,
-    "bus": 0.8, "car": 0.7, "truck": 0.7, "train": 0.8, "boat": 0.7,
-    # 自然场景
-    "sky": 0.9, "mountain": 1.0, "tree": 0.9, "grass": 0.8, "river": 0.9, "sea": 0.9,
-    # 室内家具
-    "chair": 0.6, "couch": 0.6, "sofa": 0.6, "table": 0.6, "bed": 0.6, "tv": 0.7,
-    # 低优先级背景
-    "background": 0.9, "wall": 0.5, "floor": 0.5, "window": 0.6
-}
 
 #从样本中解码图像并保存为文件
 def save_img_from_sample(model, samples_ddim, fname):
@@ -98,13 +83,6 @@ def save_img_from_sample(model, samples_ddim, fname):
 
 def feat_merge(opt, cnt_feats, sty_feats, start_step=0, mask=None,
                mask_gamma=0.7, alpha=1.5, depth_boost=True):
-    """
-    人类偏好驱动的语义掩码融合 + 风格增强。
-    参数:
-        mask_gamma: 掩码非线性压缩系数 (<1 提高风格化比例)
-        alpha: 风格分量放大系数 (>1 增强整体风格信号)
-        depth_boost: 是否对深层特征使用更强风格融合
-    """
     feat_maps = [{'config': {'gamma': opt.gamma, 'T': opt.T, 'timestep': _}}
                  for _ in range(50)]
 
@@ -168,67 +146,6 @@ def feat_merge(opt, cnt_feats, sty_feats, start_step=0, mask=None,
             print(f"[feat_merge] Layer {i} fusion applied, mean(mask)={mask.mean():.3f}")
 
     return feat_maps
-# def feat_merge(
-#     opt, cnt_feats, sty_feats,
-#     start_step=0, mask=None,
-#     mask_gamma=0.9,   # 🔧 提高 gamma，避免掩码整体抬升
-#     alpha=1.2,        # 🔧 降低默认 alpha
-#     depth_boost=True
-# ):
-#     """
-#     稳定版 CFG-inspired Attention Blending
-#     """
-#
-#     feat_maps = [{'config': {'gamma': opt.gamma, 'T': opt.T, 'timestep': _}}
-#                  for _ in range(50)]
-#
-#     if mask is not None:
-#         mask = torch.clamp(mask ** mask_gamma, 0, 1)
-#         print(f"[feat_merge] Mask stabilized (gamma={mask_gamma}), mean={mask.mean():.3f}")
-#
-#     for i in range(len(feat_maps)):
-#         if i < (50 - start_step):
-#             continue
-#
-#         cnt_feat = cnt_feats[i]
-#         sty_feat = sty_feats[i]
-#
-#         for key in cnt_feat.keys():
-#
-#             # ---- Q always from content ----
-#             if key.endswith("q"):
-#                 feat_maps[i][key] = cnt_feat[key]
-#                 continue
-#
-#             # ---- CFG-style K/V blending ----
-#             if key.endswith(("k", "v")):
-#                 Kc = cnt_feat[key]
-#                 Ks = sty_feat[key]
-#
-#                 # -------- layer-wise bias (additive, not multiplicative) --------
-#                 layer_alpha = alpha
-#                 if depth_boost:
-#                     if 4 <= i <= 6:
-#                         layer_alpha += 0.4
-#                     elif 6 < i <= 8:
-#                         layer_alpha += 0.2
-#
-#                 # -------- semantic-aware alpha --------
-#                 if mask is not None and Kc.ndim == 4:
-#                     _, _, H, W = Kc.shape
-#                     m = F.interpolate(mask, size=(H, W),
-#                                       mode="bilinear", align_corners=False)
-#                     alpha_r = layer_alpha * m
-#                 else:
-#                     alpha_r = layer_alpha
-#
-#                 # -------- soft saturation (关键稳定器) --------
-#                 alpha_r = alpha_r / (1.0 + alpha_r)
-#
-#                 # -------- CFG blending --------
-#                 feat_maps[i][key] = Kc + alpha_r * (Ks - Kc)
-#
-#     return feat_maps
 
 
 
@@ -276,64 +193,10 @@ def load_img(path, style_path=None,save_lab_preview=False, save_dir="lab_preview
     return 2.*image - 1.
 # 1. prepare_mask(mask) —— 适配尺寸 + 平滑 + 扩展通道
 # ---------------------------------------------------------
-def prepare_mask(mask, target_hw, blur=21):
-    """
-    mask: [1,1,H,W] or PIL/np
-    返回: [1,1,h,w] （与特征图同分辨率）
-    """
-    if mask is None:
-        return None
-
-    if isinstance(mask, torch.Tensor):
-        m = mask
-    else:
-        # 转 tensor + 归一化
-        m = torch.from_numpy(mask).float()
-        if m.ndim == 3:
-            m = m.mean(0, keepdim=True)
-        m = m.unsqueeze(0)
-
-    # resize
-    m = F.interpolate(m, size=target_hw, mode="bilinear", align_corners=False)
-
-    # 高斯模糊（使用卷积实现）
-    if blur > 0:
-        k = blur
-        sigma = blur / 6
-        x = torch.arange(k) - k // 2
-        gauss = torch.exp(-(x ** 2) / (2 * sigma ** 2))
-        gauss = gauss / gauss.sum()
-        kernel = gauss[:, None] * gauss[None, :]
-        kernel = kernel.to(m.device)
-        kernel = kernel.expand(1,1,k,k)
-        m = F.conv2d(m, kernel, padding=k//2)
-
-    # clamp
-    return torch.clamp(m, 0, 1)
 
 
-#实现了自适应归一化（AdaIN），用于将内容特征调整为风格特征的统计特性
-def adain(cnt_feat, sty_feat):
-    cnt_mean = cnt_feat.mean(dim=[0, 2, 3],keepdim=True)
-    cnt_std = cnt_feat.std(dim=[0, 2, 3],keepdim=True)
-    sty_mean = sty_feat.mean(dim=[0, 2, 3],keepdim=True)
-    sty_std = sty_feat.std(dim=[0, 2, 3],keepdim=True)
-    output = ((cnt_feat-cnt_mean)/cnt_std)*sty_std + sty_mean
-    return output
+
 def adain(cnt_feat, sty_feat, alpha=0.6, phi=1e-5):
-    """
-    噪声初始化模块
-    先用AdaIN将内容特征对齐到风格统计量，再与原始内容特征加权融合
-
-    参数:
-        cnt_feat: 内容特征/噪声 [B, C, H, W]
-        sty_feat: 风格特征/噪声 [B, C, H, W]
-        alpha: 融合权重，控制AdaIN结果与原始内容的比例
-        phi: 防止除零的小常数
-
-    返回:
-        融合后的特征/噪声
-    """
     # 1. 计算内容特征的统计量（均值和标准差）
     cnt_mean = cnt_feat.mean(dim=[2, 3], keepdim=True)  # [B, C, 1, 1]
     cnt_std = cnt_feat.std(dim=[2, 3], keepdim=True)  # [B, C, 1, 1]
@@ -352,112 +215,7 @@ def adain(cnt_feat, sty_feat, alpha=0.6, phi=1e-5):
     fused_feat = alpha * cnt_feat_aligned + (1 - alpha) * cnt_feat
 
     return fused_feat
-# def adain(cnt_feat, sty_feat, alpha=0.6, phi=1e-5):
-#     """
-#     自适应归一化 (AdaIN) + 可选融合内容特征
 
-#     参数:
-#         cnt_feat: 内容特征 [B, C, H, W]
-#         sty_feat: 风格特征 [B, C, H, W]
-#         alpha: 融合权重，0-1，alpha=1 完全采用风格
-#         phi: 防止除零的小常数
-
-#     返回:
-#         融合后的特征 [B, C, H, W]
-#     """
-
-#     # 1. 内容特征均值和标准差
-#     cnt_mean = cnt_feat.mean(dim=[2, 3], keepdim=True)      # [B, C, 1, 1]
-#     cnt_std  = cnt_feat.std(dim=[2, 3], keepdim=True) + phi # [B, C, 1, 1]
-
-#     # 2. 风格特征均值和标准差
-#     sty_mean = sty_feat.mean(dim=[2, 3], keepdim=True)      # [B, C, 1, 1]
-#     sty_std  = sty_feat.std(dim=[2, 3], keepdim=True) + phi # [B, C, 1, 1]
-
-#     # 3. 标准化内容特征
-#     cnt_normalized = (cnt_feat - cnt_mean) / cnt_std
-
-#     # 4. 对齐到风格统计量
-#     cnt_aligned = cnt_normalized * sty_std + sty_mean
-
-#     # 5. 融合原始内容特征
-#     fused_feat = alpha * cnt_aligned + (1 - alpha) * cnt_feat
-
-#     return fused_feat
-def get_wav(in_channels, pool=True):
-    harr_wav_L = 1 / np.sqrt(2) * np.ones((1, 2))
-    harr_wav_H = 1 / np.sqrt(2) * np.ones((1, 2))
-    harr_wav_H[0, 0] = -harr_wav_H[0, 0]
-
-    harr_wav_LL = np.transpose(harr_wav_L) * harr_wav_L
-    harr_wav_LH = np.transpose(harr_wav_L) * harr_wav_H
-    harr_wav_HL = np.transpose(harr_wav_H) * harr_wav_L
-    harr_wav_HH = np.transpose(harr_wav_H) * harr_wav_H
-
-    filter_LL = torch.from_numpy(harr_wav_LL).unsqueeze(0)
-    filter_LH = torch.from_numpy(harr_wav_LH).unsqueeze(0)
-    filter_HL = torch.from_numpy(harr_wav_HL).unsqueeze(0)
-    filter_HH = torch.from_numpy(harr_wav_HH).unsqueeze(0)
-
-    net = nn.Conv2d if pool else nn.ConvTranspose2d
-
-    LL = net(in_channels, in_channels, 2, 2, 0, bias=False, groups=in_channels)
-    LH = net(in_channels, in_channels, 2, 2, 0, bias=False, groups=in_channels)
-    HL = net(in_channels, in_channels, 2, 2, 0, bias=False, groups=in_channels)
-    HH = net(in_channels, in_channels, 2, 2, 0, bias=False, groups=in_channels)
-
-    for layer, f in zip([LL, LH, HL, HH], [filter_LL, filter_LH, filter_HL, filter_HH]):
-        layer.weight.requires_grad = False
-        layer.weight.data = f.float().unsqueeze(0).expand(in_channels, -1, -1, -1)
-
-    return LL, LH, HL, HH
-
-
-class WavePool(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.LL, self.LH, self.HL, self.HH = get_wav(in_channels)
-
-    def forward(self, x):
-        return self.LL(x), self.LH(x), self.HL(x), self.HH(x)
-
-
-class WaveUnpool(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.LL, self.LH, self.HL, self.HH = get_wav(in_channels, pool=False)
-
-    def forward(self, LL, LH, HL, HH):
-        return self.LL(LL) + self.LH(LH) + self.HL(HL) + self.HH(HH)
-class AdaINWaveletInit(nn.Module):
-    """
-    完全复刻 DGPST 的 AdaIN + Wavelet 初始化
-    """
-    def __init__(self, latent_channels=4):
-        super().__init__()
-        self.wav = WavePool(latent_channels)
-        self.wavunpool = WaveUnpool(latent_channels)
-
-    def forward(self, z_content, z_style):
-        """
-        z_content: 内容 latent (B,4,H,W)
-        z_style:   风格 latent (B,4,H,W)
-        """
-
-        #AdaIN
-        z_ada = adain(z_content, z_style)
-
-        #  Wavelet 分解
-        LL_s, _, _, _ = self.wav(z_style)      # 低频 ← 风格
-        _, LH, HL, HH = self.wav(z_ada)        # 高频 ← AdaIN latent
-
-        # Wavelet 重构
-        z_init = self.wavunpool(LL_s, LH, HL, HH)
-
-        return z_init
-
-
-adain_wavelet = AdaINWaveletInit(latent_channels=4).cuda()
 
 def color_transfer_lab(content_img, style_img, lum_clip=(0.05, 0.95), chroma_scale=0.8):
     if isinstance(content_img, Image.Image):
@@ -486,47 +244,6 @@ def color_transfer_lab(content_img, style_img, lum_clip=(0.05, 0.95), chroma_sca
     rgb_matched = np.clip(color.lab2rgb(lab_matched),0,1)
     return (rgb_matched*255).astype(np.uint8)
 
-# def color_transfer_lab_hist(gen_img, style_img,
-#                             beta=1.15, gamma=2.5, lam=0.5):
-#     """
-#     论文版：LAB直方图匹配 + 亮度微调 + 伽马校正 + 融合（后处理）
-#     """
-#
-#     if isinstance(gen_img, Image.Image):
-#         gen = np.asarray(gen_img).astype(np.float32) / 255.0
-#     else:
-#         gen = gen_img.astype(np.float32) / 255.0
-#
-#     if isinstance(style_img, Image.Image):
-#         sty = np.asarray(style_img).astype(np.float32) / 255.0
-#     else:
-#         sty = style_img.astype(np.float32) / 255.0
-#
-#     # RGB->LAB
-#     gen_lab = color.rgb2lab(gen)
-#     sty_lab = color.rgb2lab(sty)
-#
-#     out_lab = np.zeros_like(gen_lab)
-#
-#     # ---- 1) 三通道直方图匹配 ----
-#     for c in range(3):
-#         out_lab[..., c] = exposure.match_histograms(
-#             gen_lab[..., c], sty_lab[..., c]
-#         )
-#
-#     # ---- 2) 亮度微调 + 伽马校正 ----
-#     L = out_lab[..., 0] / 100.0
-#     L = np.clip(beta * L, 0, 1)
-#     L = np.power(L, 1.0 / gamma)
-#     out_lab[..., 0] = L * 100.0
-#
-#     # ---- 3) LAB->RGB ----
-#     I_ac = np.clip(color.lab2rgb(out_lab), 0, 1)
-#
-#     # ---- 4) 融合 ----
-#     I_cs = (1 - lam) * gen + lam * I_ac
-#
-#     return (np.clip(I_cs, 0, 1) * 255).astype(np.uint8)
 
 #从配置和检查点加载模型
 def load_model_from_config(config, ckpt, verbose=False):
@@ -730,7 +447,7 @@ def main():
                 )
 
 
-                # 如果用户发现掩码语义正好相反，可反转
+              
                 preference_mask = 1.0 - preference_mask
                 print(
                     f"[SemanticPref] Combined preference mask generated for {cnt_name}, mean={preference_mask.mean():.3f}")
